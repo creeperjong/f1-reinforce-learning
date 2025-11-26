@@ -1,6 +1,7 @@
 cloudpickle==1.6.0
 contourpy==1.3.0
 cycler==0.12.1
+-e git+https://github.com/f1tenth/f1tenth_gym.git@4fdb9c7e6fb7c701290f4dc18377d07c1681724f#egg=f110_gym
 Farama-Notifications==0.0.4
 filelock==3.19.1
 fonttools==4.60.1

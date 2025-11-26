@@ -1,6 +1,6 @@
 import gym
 import numpy as np
-import f110_gym
+import argparse
 from tqdm import trange
 
 from stable_baselines3 import PPO
@@ -20,6 +20,9 @@ class F110ObsWrapper(gym.ObservationWrapper):
             dtype=np.float32
         )
 
+    def step(self, action):
+        obs, reward, done, _ = self.env.step(action)
+        return obs, reward, done, _
     
     def reset(self, **kwargs):
         poses = kwargs.pop("poses", None)
@@ -28,7 +31,7 @@ class F110ObsWrapper(gym.ObservationWrapper):
             y0 = self.env.start_ys[0]
             th0 = self.env.start_thetas[0]
             poses = np.array([[x0, y0, th0]], dtype=np.float32)
-        obs, reward, done, _ = self.env.reset(poses)
+        obs, _, _, _ = self.env.reset(poses=poses)
         return self.observation(obs)
 
     def observation(self, obs):
@@ -68,21 +71,85 @@ class F110ActionWrapper(gym.ActionWrapper):
 
         return np.stack([steer, speed], axis=-1)
 
+class F110RewardWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.prev_steer = 0.0
+        self.prev_lap = 0
+
+    def reset(self, **kwargs):
+        self.prev_steer = 0.0
+        self.prev_lap = 0
+        obs = self.env.reset(**kwargs)
+        return obs
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+
+        # === Extract info ===
+        scan = obs["scans"][0]
+        vx = obs["linear_vels_x"][0]
+        yaw_rate = obs["ang_vels_z"][0]
+
+        # left/right lidar
+        left = np.mean(scan[:200])
+        right = np.mean(scan[-200:])
+        front = np.mean(scan[440:640])
+
+        # progress (simple version)
+        progress_reward = vx * 0.05
+
+        # lateral error (left-right imbalance)
+        lateral_error = left - right
+        lateral_penalty = abs(lateral_error) * 0.01
+
+        # yaw penalty
+        yaw_penalty = abs(yaw_rate) * 0.02
+
+        # steering smoothness
+        steer = action[0][0] if action.ndim == 2 else action[0]
+        steer_penalty = abs(steer - self.prev_steer) * 0.1
+        self.prev_steer = steer
+
+        # curvature-aware safe speed
+        safe_speed = np.clip(front * 0.5, 1.0, 6.0)
+        speed_penalty = max(0, vx - safe_speed) * 0.1
+
+        # collision penalty (additive)
+        collision_penalty = 20.0 if np.any(obs["collisions"]) else 0.0
+
+        # final reward
+        shaped = (
+            progress_reward
+            - lateral_penalty
+            - yaw_penalty
+            - steer_penalty
+            - speed_penalty
+            - collision_penalty
+        )
+
+        final_reward = shaped
+
+        processed = self.env.observation(obs)
+
+        return processed, final_reward, done, info
+
 def make_env(seed=0):
     def _init():
         env = gym.make("f110_gym:f110-v0", map="vegas", num_agents=1, seed=seed).unwrapped
         env = F110ObsWrapper(env)
+        env = F110RewardWrapper(env)
         env = F110ActionWrapper(env)
         return env
     set_random_seed(seed)
     return _init
 
-def train_ppo(total_timesteps=20000, model_path="ppo_f1tenth_vegas"):
+def train_ppo(total_timesteps=200000, model_path="ppo_f1tenth_vegas"):
     env = DummyVecEnv([make_env()])
 
     model = PPO("MlpPolicy", env, verbose=0)
 
-    n_chunks = 10
+    n_chunks = 100
     steps_per_chunk = total_timesteps // n_chunks
 
     print(f"Start PPO training for {total_timesteps} steps...")
@@ -96,8 +163,6 @@ def train_ppo(total_timesteps=20000, model_path="ppo_f1tenth_vegas"):
     return f"{model_path}.zip"
 
 def run_with_render(model_path, max_steps=50000):
-    import f110_gym
-
     env = gym.make(
         "f110_gym:f110-v0",
         map="vegas",
@@ -106,6 +171,7 @@ def run_with_render(model_path, max_steps=50000):
         render_mode="human"
     ).unwrapped
     wrapped = F110ObsWrapper(env)
+    wrapped = F110RewardWrapper(wrapped)
     wrapped = F110ActionWrapper(wrapped)
 
     model = PPO.load(model_path)
@@ -134,7 +200,7 @@ def debug_env():
         action = env.action_space.sample()
         obs, reward, done, info = env.step(action)
         if not np.all(np.isfinite(obs)):
-            print(f"⚠️  Non-finite obs at step {t}")
+            print(f"Non-finite obs at step {t}")
             print("action:", action)
             print("obs:", obs)
             break
@@ -154,8 +220,9 @@ def evaluate_with_render(model_path, max_steps=5000):
         render_mode="human"
     ).unwrapped
 
-    wrapped = F110ActionWrapper(env)
     wrapped = F110ObsWrapper(wrapped)
+    wrapped = F110RewardWrapper(wrapped)
+    wrapped = F110ActionWrapper(env)
 
     obs = wrapped.reset()
     done = False
@@ -171,8 +238,6 @@ def evaluate_with_render(model_path, max_steps=5000):
     env.close()
 
 def parse_args():
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, default="", help="Path to the trained PPO model.")
     return parser.parse_args()
@@ -191,4 +256,4 @@ if __name__ == "__main__":
             model_path="ppo_f1tenth_vegas"
         )
 
-        run_with_render(model_path, max_steps=800)
+        run_with_render(model_path, max_steps=10000)
