@@ -116,7 +116,7 @@ class F110RewardWrapper(gym.Wrapper):
         speed_penalty = max(0, vx - safe_speed) * 0.1
 
         # collision penalty (additive)
-        collision_penalty = 20.0 if np.any(obs["collisions"]) else 0.0
+        collision_penalty = 100.0 if np.any(obs["collisions"]) else 0.0
 
         # final reward
         shaped = (
