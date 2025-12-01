@@ -6,6 +6,7 @@ from tqdm import trange
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.vec_env import SubprocVecEnv
 
 class F110ObsWrapper(gym.ObservationWrapper):
     def __init__(self, env):
@@ -86,68 +87,91 @@ class F110RewardWrapper(gym.Wrapper):
     def step(self, action):
         obs, reward, done, info = self.env.step(action)
 
-        # === Extract info ===
         scan = obs["scans"][0]
         vx = obs["linear_vels_x"][0]
+        vy = obs["linear_vels_y"][0]
         yaw_rate = obs["ang_vels_z"][0]
 
-        # left/right lidar
-        left = np.mean(scan[:200])
-        right = np.mean(scan[-200:])
-        front = np.mean(scan[440:640])
+        # === 1. Forward reward ===
+        forward_reward = vx * 0.3
 
-        # progress (simple version)
-        progress_reward = vx * 0.05
+        # === 2. Collision penalty ===
+        if np.any(obs["collisions"]):
+            return self.env.observation(obs), -200.0, True, info
 
-        # lateral error (left-right imbalance)
-        lateral_error = left - right
-        lateral_penalty = abs(lateral_error) * 0.01
+        # === 3. Slip penalty (use vy only, not yaw_rate) ===
+        slip_penalty = -abs(vy) * 1.8
 
-        # yaw penalty
-        yaw_penalty = abs(yaw_rate) * 0.02
+        # === 4. Better curve detection using front beam shrinking ===
+        front_min = np.min(scan[400:680])  # center front
+        straight_reference = 7.0           # typical long straight front distance
 
-        # steering smoothness
+        # smaller front_min → curve approaching
+        curve_strength = np.clip((straight_reference - front_min), 0, 4.0)
+
+        # steering-dependent safe speed (more realistic)
         steer = action[0][0] if action.ndim == 2 else action[0]
-        steer_penalty = abs(steer - self.prev_steer) * 0.1
+        steer_actual = steer * 0.5  # scale to realistic steering
+
+        base_speed_limit = 5.5
+        steer_limit = base_speed_limit / (1.0 + 3.0 * abs(steer_actual))
+
+        curve_speed_limit = max(1.5, steer_limit - 0.3 * curve_strength)
+
+        # speed penalty
+        if vx > curve_speed_limit:
+            curve_penalty = -(vx - curve_speed_limit) * 0.5
+        else:
+            curve_penalty = +(curve_speed_limit - vx) * 0.1
+
+        # === 5. Steering smoothness (weaken to avoid blocking turning) ===
+        smooth_penalty = -abs(steer - self.prev_steer) * 0.1
         self.prev_steer = steer
 
-        # curvature-aware safe speed
-        safe_speed = np.clip(front * 0.5, 1.0, 6.0)
-        speed_penalty = max(0, vx - safe_speed) * 0.1
+        # === 6. Remove old apex reward (corrupted by wall geometry) ===
+        apex_reward = 0.0
 
-        # collision penalty (additive)
-        collision_penalty = 100.0 if np.any(obs["collisions"]) else 0.0
-
-        # final reward
-        shaped = (
-            progress_reward
-            - lateral_penalty
-            - yaw_penalty
-            - steer_penalty
-            - speed_penalty
-            - collision_penalty
+        # === Final reward ===
+        final_reward = (
+            forward_reward +
+            slip_penalty +
+            curve_penalty +
+            smooth_penalty +
+            apex_reward
         )
 
-        final_reward = shaped
+        return self.env.observation(obs), final_reward, done, info
 
-        processed = self.env.observation(obs)
 
-        return processed, final_reward, done, info
 
-def make_env(seed=0):
+def make_env(rank, seed=0):
     def _init():
-        env = gym.make("f110_gym:f110-v0", map="vegas", num_agents=1, seed=seed).unwrapped
+        env = gym.make(
+            "f110_gym:f110-v0",
+            map="vegas",
+            num_agents=1,
+            seed=seed + rank
+        ).unwrapped
+
         env = F110ObsWrapper(env)
         env = F110RewardWrapper(env)
         env = F110ActionWrapper(env)
+
         return env
-    set_random_seed(seed)
+
     return _init
 
-def train_ppo(total_timesteps=200000, model_path="ppo_f1tenth_vegas"):
-    env = DummyVecEnv([make_env()])
+def train_ppo(total_timesteps=2e5, model_path="ppo_f1tenth_vegas"):
+    NUM_ENVS = 12
+    env = SubprocVecEnv([make_env(i) for i in range(NUM_ENVS)])
 
-    model = PPO("MlpPolicy", env, verbose=0)
+    model = PPO(
+        "MlpPolicy",
+        env,
+        n_steps=1024,
+        batch_size=6144,
+        verbose=1,
+    )
 
     n_chunks = 100
     steps_per_chunk = total_timesteps // n_chunks
@@ -248,12 +272,10 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     if args.model_path:
-        run_with_render(args.model_path, max_steps=10000)
+        run_with_render(args.model_path)
         exit(0)
     else:
         model_path = train_ppo(
-            total_timesteps=200000,
             model_path="ppo_f1tenth_vegas"
         )
-
-        run_with_render(model_path, max_steps=10000)
+        run_with_render(model_path)
